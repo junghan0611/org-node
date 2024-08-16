@@ -1,53 +1,80 @@
 ;;; org-node-test.el -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2024 Martin Edström
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 (require 'ert)
 (require 'dash)
 (require 'org-node)
-(require 'org-node-roam)
-(require 'org-node-worker)
+(require 'org-node-parser)
 (require 'org-node-backlink)
+;; (require 'org-node-fakeroam)
 
-;; TODO Maybe org-ref &keys can easily be supported, on same principle as the
-;;      org 9.5 @keys.  See org-ref manual for syntax.  Basically worker.el
-;;      just need some more branches on merged-re and plain-re matches.
-;;
-;;      In short, what's relevant to us: org-ref v3 citations always match
-;;      plain-re because they are URIs starting with citep:, citet:, citealp:
-;;      and many others, but it's the old story where you have to match any-re
-;;      first in case it is bracketed, with spaces inside.  Like [[citep:See
-;;      &kitchin-2015-examp page 2]].  Anyway, then just extract each &key.
-;;      Finally, have to consult some org-ref variable first to get all the
-;;      defined URI types.
-;;
-;;      Wow!  I just combine the lessons I learned for supporting bracketed
-;;      link with spaces, for extracting @citekeys, and for consulting an
-;;      org-super-links variable!  Easy peasy.
-(ert-deftest org-node-test--parse-refs ()
-  (let ((result (org-node-worker--split-refs-field
-                 "[cite:@citeKey abcd ; @citeKey2 cdefgh] @foo [[https://gnu.org/A Link With Spaces/index.htm][baz]] https://gnu.org ")))
+
+;; (-all-p #'org-node-link-p (apply #'append (hash-table-values org-node--dest<>links)))
+
+(ert-deftest org-node/test-split-refs-field ()
+  (setq org-node-parser--result:paths-types nil)
+  (let ((result
+         (org-node-parser--split-refs-field
+          (concat " \"[cite:@citekey abcd ; @citekey2 cdefgh;@citekey3]\""
+                  " \"[[cite:&citekey4 abcd ; &citekey5 cdefgh;&citekey6]]\""
+                  " \"[[https://gnu.org/A Link With Spaces/index2.htm]]\""
+                  " [[https://gnu.org/A Link With Spaces/index.htm][baz]]"
+                  " https://gnu.org [citep:&citekey7]  @foo &bar "
+                  " info:with%20escaped%20spaces"))))
     (should (--all-p (member it result)
-                     '("@citeKey2"
-                       "@citeKey"
-                       "@foo"
-                       "https://gnu.org/A Link With Spaces/index.htm"
-                       "https://gnu.org")))))
+                     '("citekey"
+                       "citekey4"
+                       "citekey7"
+                       "foo"
+                       "bar"
+                       "with escaped spaces"
+                       "//gnu.org/A Link With Spaces/index.htm"
+                       "//gnu.org/A Link With Spaces/index2.htm"
+                       "//gnu.org")))
+    (should (equal "https" (cdr (assoc "//gnu.org/A Link With Spaces/index.htm"
+                                       org-node-parser--result:paths-types))))
+    (should (equal "https" (cdr (assoc "//gnu.org"
+                                       org-node-parser--result:paths-types))))
+    (should (equal nil (cdr (assoc "citeKey"
+                                   org-node-parser--result:paths-types))))))
 
-(ert-deftest org-node-test--oldata-fns ()
+(ert-deftest org-node/test-time-format-hacks ()
+  (let ((fmt "Wild%Y--%m%dexample%H%M%S-"))
+    (should (equal (org-node--extract-ymd
+                    (format-time-string fmt '(26300 36406 109008 201000))
+                    fmt)
+                   "2024-08-14"))))
+
+(ert-deftest org-node/test-oldata-fns ()
   (let ((olp '((3730 "A subheading" 2 "33dd")
                (2503 "A top heading" 1 "d3rh")
                (1300 "A sub-subheading" 3 "d3csae")
                (1001 "A subheading" 2 "d3")
                (199 "Another top heading" 1)
                (123 "First heading in file is apparently third-level" 3))))
-    (should (equal (org-node-worker--pos->olp olp 1300)
+    (should (equal (org-node-parser--pos->olp olp 1300)
                    '("Another top heading" "A subheading")))
-    (should (equal (org-node-worker--pos->olp olp 2503)
+    (should (equal (org-node-parser--pos->olp olp 2503)
                    nil))
-    (should-error (org-node-worker--pos->olp olp 2500))
-    (should (equal (org-node-worker--pos->parent-id olp 1300 nil)
+    (should-error (org-node-parser--pos->olp olp 2500))
+    (should (equal (org-node-parser--pos->parent-id olp 1300 nil)
                    "d3"))))
 
-(ert-deftest org-node-test--parse-testfile2.org ()
+(ert-deftest org-node/test-parsing-testfile2.org ()
   (org-node--scan-targeted (list "testfile2.org"))
   (org-node-cache-ensure t)
   (let ((node (gethash "bb02315f-f329-4566-805e-1bf17e6d892d" org-node--id<>node)))
@@ -60,7 +87,7 @@
     (should (equal (org-node-get-title node) "3rd-level, has ID"))
     (should (equal (org-node-get-todo node) nil))))
 
-(ert-deftest org-node-test--multiple-id-dirs ()
+(ert-deftest org-node/test-having-multiple-id-dirs ()
   (mkdir "/tmp/org-node/test1" t)
   (mkdir "/tmp/org-node/test2" t)
   (write-region "" nil "/tmp/org-node/test2/emptyfile.org")
@@ -70,10 +97,10 @@
         (org-node-extra-id-dirs '("/tmp/org-node/test1/"
                                   "/tmp/org-node/test2/"))
         (org-node-ask-directory nil))
-    (should (equal (car (org-node--root-dirs (org-node-files)))
+    (should (equal (car (org-node--root-dirs (org-node-list-files)))
                    "/tmp/org-node/test2/"))))
 
-(ert-deftest org-node-test--goto-random ()
+(ert-deftest org-node/test-goto-random ()
   (require 'seq)
   (org-node--scan-targeted (list "testfile2.org"))
   (org-node-cache-ensure t)
@@ -83,16 +110,32 @@
     (should (equal (abbreviate-file-name (buffer-file-name))
                    (org-node-get-file-path node)))))
 
-(ert-deftest org-node-test--split-file-list ()
+(ert-deftest org-node/test-split-into-n-sublists ()
   (should (equal 4 (length (org-node--split-into-n-sublists
                             '(a v e e) 7))))
   (should (equal 1 (length (org-node--split-into-n-sublists
                             '(a v e e) 1))))
   (should (equal 4 (length (org-node--split-into-n-sublists
-                            '(a v e e q l fk k k ki i o r r r r r r r r r r g g g g g gg)
+                            '(a v e e q l fk k k ki i o r r r r r r  r g g gg)
                             4)))))
 
-(ert-deftest org-node-test--various ()
+(ert-deftest org-node/test-file-naming ()
+  (let ((org-node-filename-fn #'org-node-slugify-for-web))
+    (should (equal (org-node--name-file "19 Foo bar Baz 588")
+                   "19-foo-bar-baz-588.org")))
+  (let ((org-node-filename-fn nil)
+        (org-node-datestamp-format "")
+        (org-node-slug-fn #'org-node-slugify-for-web))
+    (should (equal (org-node--name-file "19 Foo bar Baz 588")
+                   "19-foo-bar-baz-588.org"))
+    (should (equal (funcall org-node-slug-fn "19 Foo bar Baz 588")
+                   "19-foo-bar-baz-588")))
+  (should (equal (org-node--time-format-to-regexp "%Y%M%d")
+                 "^[[:digit:]]+"))
+  (should (equal (org-node--time-format-to-regexp "%A%Y%M%d-")
+                 "^[[:alpha:]]+[[:digit:]]+-")))
+
+(ert-deftest org-node/test-various ()
   (let ((org-node-ask-directory "/tmp/org-node/test/")
         ;; NOTE you should manually test the other creation-fns
         (org-node-creation-fn #'org-node-new-file))
@@ -118,7 +161,5 @@
         (should (equal (org-node-get-file-title node) nil))
         (should (equal (org-node-get-file-title-or-basename node)
                        expected-filename))))))
-
-(provide 'org-node-test)
 
 ;;; org-node-test.el ends here

@@ -1,7 +1,22 @@
 ;;; org-node-backlink.el -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2024 Martin Edström
+;;
+;; This file is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation; either version 3, or (at your option)
+;; any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; For a full copy of the GNU General Public License
+;; see <http://www.gnu.org/licenses/>.
+
 (require 'org-node)
-(require 'cl-macs)
+(require 'cl-lib)
 
 (let (warned-once)
   (defun org-node-backlinks-mode (&rest args)
@@ -14,15 +29,10 @@
 ;;;; Minor mode
 
 ;;;###autoload
-(define-globalized-minor-mode org-node-backlink-global-mode
-  org-node-backlink-mode
-  (lambda ()
-    (when (derived-mode-p 'org-mode)
-      (org-node-backlink-mode))))
-
-;;;###autoload
 (define-minor-mode org-node-backlink-mode
-  "Keep :BACKLINKS: properties updated."
+  "Keep :BACKLINKS: properties updated.
+
+-----"
   :group 'org-node
   (if org-node-backlink-mode
       (progn
@@ -31,9 +41,9 @@
         (add-hook 'org-node-insert-link-hook
                   #'org-node-backlink--add-in-target nil t)
         (add-hook 'after-change-functions
-                  #'org-node-backlink--flag-change nil t)
+                  #'org-node-backlink--flag-buffer-modification nil t)
         (add-hook 'before-save-hook
-                  #'org-node-backlink--fix-changed-parts-of-buffer nil t)
+                  #'org-node-backlink--fix-flagged-parts-of-buffer nil t)
         ;; We won't clean up this advice when the mode is turned off, because
         ;; it's a buffer-local mode and advices cannot be buffer-local, but
         ;; it's OK because it's made to no-op where the mode is inactive.
@@ -45,9 +55,17 @@
     (remove-hook 'org-node-insert-link-hook
                  #'org-node-backlink--add-in-target t)
     (remove-hook 'after-change-functions
-                 #'org-node-backlink--flag-change t)
+                 #'org-node-backlink--flag-buffer-modification t)
     (remove-hook 'before-save-hook
-                 #'org-node-backlink--fix-changed-parts-of-buffer t)))
+                 #'org-node-backlink--fix-flagged-parts-of-buffer t)))
+
+;;;###autoload
+(define-globalized-minor-mode org-node-backlink-global-mode
+  org-node-backlink-mode
+  (lambda ()
+    (when (derived-mode-p 'org-mode)
+      (org-node-backlink-mode)))
+  :group 'org-node)
 
 
 ;;;; Validation of one buffer at a time
@@ -73,6 +91,7 @@ Can be quit midway through and resumed later.  With
   (when (or (null org-node-backlink--files-to-fix) current-prefix-arg)
     ;; Start over
     (org-node-cache-ensure t t)
+    (setq org-node-backlink--fix-ctr 0)
     (setq org-node-backlink--files-to-fix
           (-uniq (hash-table-values org-id-locations))))
   (when (or (not (= 0 org-node-backlink--fix-ctr)) ;; resume interrupted
@@ -92,9 +111,7 @@ Can be quit midway through and resumed later.  With
             (org-node-backlink--fix-whole-buffer remove?)))))
     (if org-node-backlink--files-to-fix
         ;; Keep going
-        (run-with-timer 1 nil #'org-node-backlink-fix-all remove?)
-      ;; Reset
-      (setq org-node-backlink--fix-ctr 0))))
+        (run-with-timer 1 nil #'org-node-backlink-fix-all remove?))))
 
 (defun org-node-backlink--fix-whole-buffer (&optional remove?)
   (save-excursion
@@ -109,24 +126,26 @@ then update the :BACKLINKS: property in this entry.  With arg
 REMOVE, remove it instead."
   (if remove?
       (org-entry-delete nil "BACKLINKS")
+    ;; Um... I think this way of grabbing the ID is a holdover from when I was
+    ;; using fundamental-mode buffers?
     (skip-chars-forward "[:space:]")
     (let* ((id (buffer-substring-no-properties
                 (point) (+ (point) (skip-chars-forward "^ \n"))))
            (node (gethash id org-node--id<>node)))
       (when node
         ;; Make the full string to which the :BACKLINKS: property should be set
-        (let* ((reflinks (org-node-get-reflinks node))
-               (backlinks (gethash id org-node--id<>backlinks))
-               (citations (org-node-get-citations node))
-               (combined
+        (let* ((combined
                 (thread-last
-                  (append reflinks backlinks)
-                  (--map (plist-get it :origin))
+                  (append (org-node-get-id-links node)
+                          (org-node-get-reflinks node))
+                  ;; Extract just the origin IDs
+                  (-map  #'org-node-link-origin)
                   (-uniq)
-                  (-non-nil) ;; REVIEW why can there be nils?
+                  (-non-nil) ;; REVIEW: no nils anymore, I hope
                   (-sort #'string-lessp)
-                  ;; At this point we have a sorted list of ids of
-                  ;; every node that links to here.  Now format them as links.
+                  ;; At this point we have a sorted list of IDs of every node
+                  ;; that links to here.  (Yes, sorted UUIDs---nearly
+                  ;; senseless.)  Now format them pretty Org links.
                   (--map (org-link-make-string
                           (concat "id:" it)
                           (org-node-get-title
@@ -139,11 +158,14 @@ REMOVE, remove it instead."
                 (org-entry-put nil "BACKLINKS" links-string))
             (org-entry-delete nil "BACKLINKS")))))))
 
-(defun org-node-backlink--fix-changed-parts-of-buffer ()
-  "Look for areas flagged by `org-node-backlink--flag-change' and
+;; FIXME: Only operates where text has been added, not deleted
+(defun org-node-backlink--fix-flagged-parts-of-buffer ()
+  "Look for areas flagged by `org-node-backlink--flag-buffer-modification' and
 run `org-node-backlink--fix-subtree-here' at each affected
 subtree.  For a huge file, this is much faster than using
 `org-node-backlink--fix-whole-buffer'."
+  (unless (derived-mode-p 'org-mode)
+    (error "Backlink function called in non-Org buffer"))
   (when org-node-backlink-mode
     ;; Catch any error because this runs at `before-save-hook' which MUST fail
     ;; gracefully and let the user save anyway
@@ -163,6 +185,7 @@ subtree.  For a huge file, this is much faster than using
                   (end (make-marker))
                   (case-fold-search t)
                   prop)
+              ;; (goto-char start)
               (while (< start (point-max))
                 (setq prop (get-text-property start 'org-node-flag))
                 (set-marker end (or (text-property-not-all
@@ -202,14 +225,21 @@ subtree.  For a huge file, this is much faster than using
          (message "org-node: Printing backtrace")
          (backtrace))))))
 
-(defun org-node-backlink--flag-change (beg end _)
+(defun org-node-backlink--flag-buffer-modification (beg end _n-deleted-chars)
   "Add text property `org-node-flag' to region between BEG and END.
 
 Designed for `after-change-functions', so this effectively flags
-all areas where text is added/changed/deleted."
-  (when (derived-mode-p 'org-mode)
+all areas where text is added/changed/deleted.  Where text was
+purely deleted, it flags the preceding and succeeding char."
+  (unless (derived-mode-p 'org-mode)
+    (error "Backlink function called in non-Org buffer"))
+  (when org-node-backlink-mode
     (with-silent-modifications
-      (put-text-property beg end 'org-node-flag t))))
+      (if (= beg end)
+          (put-text-property (max (1- beg) 1)
+                             (min (1+ end) (point-max))
+                             'org-node-flag t)
+        (put-text-property beg end 'org-node-flag t)))))
 
 
 ;;;; Link-insertion advice
@@ -234,14 +264,15 @@ all areas where text is added/changed/deleted."
 ;;    `org-node-backlink--fix-whole-buffer', which can easily take a while for
 ;;    a big target file.
 
-;; TODO Report when it has members
+;; TODO: Report when it has members
 (defvar org-node-backlink--fails nil
   "List of IDs that could not be resolved.")
 
 (defun org-node-backlink--add-in-target (&rest _)
   "For known link at point, leave a backlink in the target node."
   (unless (derived-mode-p 'org-mode)
-    (error "Called in non-org buffer"))
+    (error "Backlink function called in non-Org buffer"))
+  (require 'org-element)
   (when org-node-backlink-mode
     (org-node-cache-ensure)
     (let ((elm (org-element-context)))
@@ -249,16 +280,13 @@ all areas where text is added/changed/deleted."
             (type (org-element-property :type elm))
             id file)
         (when (and path type)
-          ;; REVIEW Here is actually interesting space to consider merging
-          ;; some code for backlinks and reflinks by just considering ids
-          ;; themselves as a kind of ref...
           (if (equal "id" type)
               ;; Classic backlink
               (progn
                 (setq id path)
                 (setq file (org-id-find-id-file id)))
             ;; "Reflink"
-            (setq id (gethash (concat type ":" path) org-node--ref<>id))
+            (setq id (gethash path org-node--ref<>id))
             (setq file (ignore-errors
                          (org-node-get-file-path
                           (gethash id org-node--id<>node)))))
@@ -278,7 +306,7 @@ all areas where text is added/changed/deleted."
                  (or (org-get-heading t t t t)
                      (cadar (org-collect-keywords '("TITLE")))
                      (file-name-nondirectory buffer-file-name))))))
-        ;; Ensure that `org-node-backlink--fix-changed-parts-of-buffer' will
+        ;; Ensure that `org-node-backlink--fix-flagged-parts-of-buffer' will
         ;; not later remove the backlink we're adding
         (org-node--dirty-ensure-node-known)
         (let ((org-node--imminent-recovery-msg
@@ -323,9 +351,9 @@ all areas where text is added/changed/deleted."
             (setq new-value (string-join links "  ")))
         (setq new-value src-link))
       (unless (equal current-backlinks-value new-value)
-        ;; TODO don't inhibit all modification hooks, just
-        ;;      inhibit `org-node-backlink--flag-change'
-        (let ((inhibit-modification-hooks t))
+        (let ((after-change-functions
+               (remq 'org-node-backlink--flag-buffer-modification
+                     after-change-functions)))
           (org-entry-put nil "BACKLINKS" new-value))))))
 
 (provide 'org-node-backlink)
